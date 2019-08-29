@@ -5,12 +5,11 @@
 package kotlinx.coroutines.guava
 
 import com.google.common.util.concurrent.*
-import com.google.common.util.concurrent.internal.InternalFutureFailureAccess
-import com.google.common.util.concurrent.internal.InternalFutures
-import java.util.concurrent.*
-import kotlin.coroutines.*
+import com.google.common.util.concurrent.internal.*
 import kotlinx.coroutines.*
+import java.util.concurrent.*
 import java.util.concurrent.CancellationException
+import kotlin.coroutines.*
 
 /**
  * Starts [block] in a new coroutine and returns a [ListenableFuture] pointing to its result.
@@ -121,13 +120,7 @@ public fun <T> ListenableFuture<T>.asDeferred(): Deferred<T> {
     if (isDone) {
         return try {
             val value = Uninterruptibles.getUninterruptibly(this)
-            if (value == null) {
-                CompletableDeferred<T>().also {
-                    it.completeExceptionally(KotlinNullPointerException())
-                }
-            } else {
-                CompletableDeferred(value)
-            }
+            CompletableDeferred<T>(value as T)
         } catch (e: CancellationException) {
             CompletableDeferred<T>().also { it.cancel(e) }
         } catch (e: ExecutionException) {
@@ -142,7 +135,8 @@ public fun <T> ListenableFuture<T>.asDeferred(): Deferred<T> {
     val deferred = CompletableDeferred<T>()
     Futures.addCallback(this, object : FutureCallback<T> {
         override fun onSuccess(result: T?) {
-            deferred.complete(result!!)
+            @Suppress("UNCHECKED_CAST")
+            deferred.complete(result as T)
         }
 
         override fun onFailure(t: Throwable) {
@@ -237,8 +231,9 @@ public suspend fun <T> ListenableFuture<T>.await(): T {
 
     return suspendCancellableCoroutine { cont: CancellableContinuation<T> ->
         addListener(
-          ToContinuation(this, cont),
-          MoreExecutors.directExecutor())
+            ToContinuation(this, cont),
+            MoreExecutors.directExecutor()
+        )
         cont.invokeOnCancellation {
             cancel(false)
         }
@@ -253,22 +248,23 @@ public suspend fun <T> ListenableFuture<T>.await(): T {
  * [ExecutionException] when thrown.
  */
 private class ToContinuation<T>(
-    val futureToObserve: ListenableFuture<T>,
-    val continuation: CancellableContinuation<T>
+    private val futureToObserve: ListenableFuture<T>,
+    private val continuation: CancellableContinuation<T>
 ): Runnable {
     override fun run() {
         if (futureToObserve.isCancelled) {
             continuation.cancel()
-        } else {
-            try {
-                continuation.resumeWith(
-                  Result.success(Uninterruptibles.getUninterruptibly(futureToObserve)))
-            } catch (e: ExecutionException) {
-                // ExecutionException is the only kind of exception that can be thrown from a gotten
-                // Future. Anything else showing up here indicates a very fundamental bug in a
-                // Future implementation.
-                continuation.resumeWithException(e.nonNullCause())
-            }
+            return
+        }
+        try {
+            continuation.resumeWith(
+                Result.success(Uninterruptibles.getUninterruptibly(futureToObserve))
+            )
+        } catch (e: ExecutionException) {
+            // ExecutionException is the only kind of exception that can be thrown from a gotten
+            // Future. Anything else showing up here indicates a very fundamental bug in a
+            // Future implementation.
+            continuation.resumeWithException(e.nonNullCause())
         }
     }
 }
@@ -339,14 +335,14 @@ private class ListenableFutureCoroutine<T>(
  *   - Fully correct cancellation and listener happens-after obeying [Future] and
  *     [ListenableFuture]'s documented and implicit contracts is surprisingly difficult to achieve.
  *     The best way to be correct, especially given the fun corner cases from
- *     [AsyncFuture.setAsync], is to just use an [AsyncFuture].
- *   - To maintain sanity, this class implements [ListenableFuture] and uses an inner [AsyncFuture]
+ *     [AbstractFuture.setFuture], is to just use an [AbstractFuture].
+ *   - To maintain sanity, this class implements [ListenableFuture] and uses an inner [AbstractFuture]
  *     around its input [deferred] as a state engine to establish happens-after-completion. This
- *     could probably be compressed into one subclass of [AsyncFuture] to save an allocation, at the
+ *     could probably be compressed into one subclass of [AbstractFuture] to save an allocation, at the
  *     cost of the implementation's readability.
  */
 private class OuterFuture<T>(private val deferred: Deferred<T>): ListenableFuture<T> {
-    val innerFuture = DeferredListenableFuture(deferred)
+    private val innerFuture = DeferredListenableFuture(deferred)
 
     // Adding the listener after initialization resolves partial construction hairpin problem.
     //
@@ -458,11 +454,7 @@ private class DeferredListenableFuture<T>(
      * that certain combinations of cancelled/cancelling states can't be observed.
      */
     override fun cancel(mayInterruptIfRunning: Boolean): Boolean {
-        return if (super.cancel(mayInterruptIfRunning)) {
-            deferred.cancel()
-            true
-        } else {
-            false
-        }
+        deferred.cancel() // Job.cancel is idempotent
+        return super.cancel(mayInterruptIfRunning)
     }
 }
